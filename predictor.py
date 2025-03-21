@@ -26,8 +26,8 @@ class ShortTermPredictor:
             ('smote', SMOTE(random_state=42, k_neighbors=5)),
             ('scaler', RobustScaler()),
             ('classifier', GradientBoostingClassifier(
-                n_estimators=150,
-                learning_rate=0.04,
+                n_estimators=100,
+                learning_rate=0.06,
                 max_depth=6,
                 subsample=0.8,
                 random_state=42,
