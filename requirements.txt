@@ -1,0 +1,6 @@
+yfinance
+scikit-learn
+imbalanced-learn
+pandas
+numpy
+fastapi[standard]
