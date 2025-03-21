@@ -24,8 +24,8 @@ class ShortTermPredictor:
             ('smote', SMOTE(random_state=42, k_neighbors=5)),
             ('scaler', RobustScaler()),
             ('classifier', GradientBoostingClassifier(
-                n_estimators=200,
-                learning_rate=0.02,
+                n_estimators=150,
+                learning_rate=0.04,
                 max_depth=6,
                 subsample=0.8,
                 random_state=42,
@@ -233,7 +233,7 @@ class ShortTermPredictor:
                 self.pipeline.steps[0] = ('smote', SMOTE(random_state=42, k_neighbors=3, sampling_strategy=0.8))
 
             # Split the data using TimeSeriesSplit
-            tscv = TimeSeriesSplit(n_splits=5)
+            tscv = TimeSeriesSplit(n_splits=4)
 
             # Perform hyperparameter optimization if requested
             if hyperparameter_optimization:
