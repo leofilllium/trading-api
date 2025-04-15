@@ -53,45 +53,61 @@ class ShortTermPredictor:
         self.avg_change_down = None
         self.base_predictions = None # Store predictions from CV for analysis
 
-
     def prepare_features(self, df):
         """
         Calculates technical indicators and prepares features for the model.
-        Handles both single-symbol and multi-symbol (via MultiIndex) DataFrames from yfinance.
+        Includes enhanced NaN and Inf handling.
         """
         try:
             data = pd.DataFrame()
             # Standardize column access, handle MultiIndex if present
             if isinstance(df.columns, pd.MultiIndex):
-                 # If MultiIndex, assume structure like ('Open', 'BTC-USD')
-                 logging.debug("MultiIndex detected in DataFrame columns.")
-                 for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                      if (col, self.symbol) in df.columns:
-                           data[col] = df[(col, self.symbol)]
-                      elif col in df.columns: # Fallback if only single level column name exists
-                           data[col] = df[col]
-                      else:
-                           raise ValueError(f"Required column '{col}' not found for symbol '{self.symbol}' in MultiIndex.")
+                logging.debug("MultiIndex detected in DataFrame columns.")
+                required_cols_base = ['Open', 'High', 'Low', 'Close', 'Volume']
+                present_cols = []
+                for col in required_cols_base:
+                    if (col, self.symbol) in df.columns:
+                        data[col] = df[(col, self.symbol)]
+                        present_cols.append(col)
+                    elif col in df.columns.levels[0]:  # Check if base name exists at level 0
+                        # Attempt to find the symbol at level 1 for this column
+                        level1_options = df.columns[df.columns.get_level_values(0) == col].get_level_values(1)
+                        if self.symbol in level1_options:
+                            data[col] = df[(col, self.symbol)]
+                            present_cols.append(col)
+                if len(present_cols) != len(required_cols_base):
+                    missing = set(required_cols_base) - set(present_cols)
+                    raise ValueError(
+                        f"Required columns missing for symbol '{self.symbol}' in MultiIndex: {list(missing)}")
+
             else:
                 # If single-level index, copy necessary columns
                 logging.debug("Single-level index detected in DataFrame columns.")
                 required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
                 if not all(col in df.columns for col in required_cols):
-                     raise ValueError(f"Missing one or more required columns: {required_cols}. Found: {df.columns.tolist()}")
+                    raise ValueError(
+                        f"Missing one or more required columns: {required_cols}. Found: {df.columns.tolist()}")
                 data = df[required_cols].copy()
 
+            # --- Initial Data Cleaning ---
             if data.isnull().values.any():
-                logging.warning("NaN values detected in input data before feature engineering. Attempting to fill.")
+                logging.warning(
+                    f"NaN values detected in initial input data (Shape: {data.shape}). Count per column:\n{data.isnull().sum()}")
                 # Simple forward fill might be appropriate for time series price data
+                rows_before_ffill = len(data)
                 data.ffill(inplace=True)
-                # Drop any remaining NaNs at the beginning
+                # Drop any remaining NaNs at the beginning (if ffill couldn't fill them)
                 data.dropna(axis=0, how='any', inplace=True)
+                rows_after_dropna = len(data)
+                logging.info(
+                    f"Applied ffill and dropna to initial data. Rows changed from {rows_before_ffill} to {rows_after_dropna}.")
                 if data.empty:
-                     raise ValueError("DataFrame is empty after handling initial NaNs.")
+                    raise ValueError("DataFrame became empty after handling initial NaNs.")
 
             # --- Feature Engineering ---
+            # (All the feature calculations remain the same as before)
             data['returns'] = data['Close'].pct_change()
-            data['vol'] = data['returns'].rolling(window=5).std() * np.sqrt(252) # Annualized volatility (adjust factor if needed)
+            data['vol'] = data['returns'].rolling(window=5).std() * np.sqrt(252)
             data['momentum'] = data['Close'] - data['Close'].shift(5)
             data['SMA5'] = data['Close'].rolling(window=5).mean()
             data['SMA10'] = data['Close'].rolling(window=10).mean()
@@ -104,68 +120,60 @@ class ShortTermPredictor:
             data['close_open_range'] = data['Close'] - data['Open']
             data['ATR'] = data['high_low_range'].rolling(window=14).mean()
 
-            volume_ma5 = data['Volume'].rolling(window=5).mean().replace(0, 1e-6) # Avoid division by zero
+            volume_ma5 = data['Volume'].rolling(window=5).mean().replace(0, 1e-6)  # Avoid division by zero
             volume_ma10 = data['Volume'].rolling(window=10).mean().replace(0, 1e-6)
-            data['volume_ratio'] = data['Volume'].div(volume_ma5).clip(upper=10) # Clip extreme values
+            data['volume_ratio'] = data['Volume'].div(volume_ma5).clip(upper=10)  # Clip extreme values
             data['volume_ratio_10'] = data['Volume'].div(volume_ma10).clip(upper=10)
 
-            # RSI Calculation
             for window in [7, 14, 21]:
                 delta = data['Close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=window, min_periods=1).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=window, min_periods=1).mean()
-                rs = gain / loss.replace(0, 1e-6) # Avoid division by zero
+                rs = gain / loss.replace(0, 1e-6)  # Avoid division by zero
                 data[f'RSI_{window}'] = 100 - (100 / (1 + rs))
-                data[f'RSI_{window}'].fillna(50, inplace=True) # Fill initial NaNs with neutral 50
+                data[f'RSI_{window}'].fillna(50, inplace=True)  # Fill initial NaNs with neutral 50
 
-            # Bollinger Bands
             data['bollinger_mid'] = data['Close'].rolling(window=20).mean()
             data['bollinger_std'] = data['Close'].rolling(window=20).std()
             data['bollinger_upper'] = data['bollinger_mid'] + (data['bollinger_std'] * 2)
             data['bollinger_lower'] = data['bollinger_mid'] - (data['bollinger_std'] * 2)
-            data['bollinger_width'] = (data['bollinger_upper'] - data['bollinger_lower']) / data['bollinger_mid'].replace(0, 1e-6) # Normalized width
+            # Use non-zero mid band for normalization
+            data['bollinger_width'] = (data['bollinger_upper'] - data['bollinger_lower']) / data[
+                'bollinger_mid'].replace(0, 1e-6)
 
-            # MACD
             data['MACD'] = data['EMA12'] - data['EMA26']
             data['MACD_signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
             data['MACD_hist'] = data['MACD'] - data['MACD_signal']
 
-            # Stochastic Oscillator (%K, %D)
             low_min = data['Low'].rolling(window=14).min()
             high_max = data['High'].rolling(window=14).max()
-            data['%K'] = 100 * ((data['Close'] - low_min) / (high_max - low_min).replace(0, 1e-6))
+            stoch_range = (high_max - low_min).replace(0, 1e-6)  # Avoid div by zero here
+            data['%K'] = 100 * ((data['Close'] - low_min) / stoch_range)
             data['%D'] = data['%K'].rolling(window=3).mean()
-            data['%K'].fillna(50, inplace=True) # Handle potential NaNs
+            data['%K'].fillna(50, inplace=True)  # Handle potential NaNs
             data['%D'].fillna(50, inplace=True)
 
-            # Rate of Change (ROC)
             data['ROC'] = data['Close'].pct_change(periods=12) * 100
-
-            # On Balance Volume (OBV) - Simplified calculation
             data['OBV'] = (np.sign(data['Close'].diff()).fillna(0) * data['Volume']).cumsum()
-
-            # Candlestick Patterns (simple examples)
             data['open_equals_low'] = (data['Open'] == data['Low']).astype(int)
             data['open_equals_high'] = (data['Open'] == data['High']).astype(int)
-
-            # Volume Price Trend (VPT)
             data['VPT'] = (data['Volume'] * data['returns']).cumsum()
 
-            # Chaikin Money Flow (CMF)
-            mfm = ((data['Close'] - data['Low']) - (data['High'] - data['Close'])) / (data['High'] - data['Low']).replace(0, 1e-6)
+            mfm_range = (data['High'] - data['Low']).replace(0, 1e-6)  # Avoid div by zero
+            mfm = ((data['Close'] - data['Low']) - (data['High'] - data['Close'])) / mfm_range
             mfv = mfm * data['Volume']
-            data['CMF'] = mfv.rolling(window=20).sum() / data['Volume'].rolling(window=20).sum().replace(0, 1e-6)
-            data['CMF'].fillna(0, inplace=True) # Fill initial NaNs
+            cmf_vol_sum = data['Volume'].rolling(window=20).sum().replace(0, 1e-6)  # Avoid div by zero
+            data['CMF'] = mfv.rolling(window=20).sum() / cmf_vol_sum
+            data['CMF'].fillna(0, inplace=True)  # Fill initial NaNs
 
-            # Interaction Features
             data['RSI_vol_ratio'] = data['RSI_14'] * data['volume_ratio']
             data['momentum_volume'] = data['momentum'] * data['volume_ratio']
             data['bollinger_momentum'] = data['bollinger_width'] * data['momentum']
 
-            # Target Variable: 1 if price goes up in `self.minutes`, 0 otherwise
+            # Target Variable
             data['target'] = (data['Close'].shift(-self.minutes) > data['Close']).astype(int)
 
-            # Lagged Features (use adjusted column names if needed)
+            # Lagged Features
             for lag in range(1, 4):
                 data[f'returns_lag{lag}'] = data['returns'].shift(lag)
                 data[f'vol_lag{lag}'] = data['vol'].shift(lag)
@@ -173,11 +181,11 @@ class ShortTermPredictor:
                 data[f'MACD_lag{lag}'] = data['MACD'].shift(lag)
                 data[f'volume_ratio_lag{lag}'] = data['volume_ratio'].shift(lag)
 
-            # Drop rows with NaN values created by rolling windows, diffs, and shifts
+            # --- Final NaN Drop and Feature Selection ---
             initial_rows = len(data)
-            data = data.dropna()
+            data = data.dropna()  # Drop rows with NaNs from shifts/rolling windows
             final_rows = len(data)
-            logging.info(f"Feature engineering complete. Dropped {initial_rows - final_rows} rows with NaNs.")
+            logging.info(f"Dropped {initial_rows - final_rows} rows with NaNs after feature calculation.")
 
             # Define feature columns *after* all features are created
             self.feature_columns = [
@@ -193,33 +201,72 @@ class ShortTermPredictor:
                 'volume_ratio_lag1', 'volume_ratio_lag2', 'volume_ratio_lag3'
             ]
 
-            # Ensure all feature columns exist in the dataframe
-            missing_cols = [col for col in self.feature_columns if col not in data.columns]
-            if missing_cols:
-                raise RuntimeError(f"Internal error: Defined feature columns missing after creation: {missing_cols}")
-
-            if final_rows < 50: # Check after dropping NaNs
-                 raise ValueError(f"Insufficient data points ({final_rows}) after feature calculation for reliable prediction. Need at least 50.")
+            # Check if target and features exist
+            if 'target' not in data.columns:
+                raise RuntimeError("Internal error: 'target' column missing before final selection.")
+            missing_defined_cols = [col for col in self.feature_columns if col not in data.columns]
+            if missing_defined_cols:
+                raise RuntimeError(
+                    f"Internal error: Defined feature columns missing after creation: {missing_defined_cols}")
 
             features = data[self.feature_columns]
             target = data['target']
 
-            # Replace any potential +/- infinity values with large finite numbers or NaN then fill
-            features = features.replace([np.inf, -np.inf], np.nan)
-            if features.isnull().values.any():
-                 logging.warning("NaN or Inf values detected in features AFTER initial dropna. Filling with column median.")
-                 # Impute NaNs that might have appeared due to edge cases (e.g., division by zero before replace)
-                 features = features.fillna(features.median())
+            # --- Robust Final Cleaning (Inf/NaN Handling) ---
+            num_inf_before = np.isinf(features.values).sum()
+            if num_inf_before > 0:
+                logging.warning(
+                    f"Detected {num_inf_before} infinity values in features before final cleaning. Replacing with NaN.")
+                features = features.replace([np.inf, -np.inf], np.nan)
 
+            num_nan_before_final_fill = features.isnull().values.sum()
+            if num_nan_before_final_fill > 0:
+                logging.warning(
+                    f"Detected {num_nan_before_final_fill} NaN values in features before final fill. Checking for all-NaN columns.")
+                # Check for columns that are ALL NaN
+                cols_all_nan = features.columns[features.isnull().all()].tolist()
+                if cols_all_nan:
+                    logging.warning(f"Columns are entirely NaN: {cols_all_nan}. Dropping these columns.")
+                    features = features.drop(columns=cols_all_nan)
+                    # Need to update self.feature_columns if we drop cols, although select_features will run later
+                    self.feature_columns = features.columns.tolist()
+                    if features.empty:
+                        raise ValueError("Feature DataFrame became empty after dropping all-NaN columns.")
 
-            logging.info(f"Successfully prepared features. Shape: {features.shape}")
+                # Fill remaining NaNs with median if possible, else 0
+                if features.isnull().values.any():  # Check again after dropping all-NaN cols
+                    logging.warning("Filling remaining NaNs with column medians (or 0 if median is NaN).")
+                    medians = features.median()
+                    # Fill medians where available
+                    features = features.fillna(medians)
+                    # If any NaNs remain (e.g., median was NaN), fill with 0
+                    if features.isnull().values.any():
+                        logging.warning("NaNs still present after median fill. Filling remaining with 0.")
+                        features = features.fillna(0)
+
+            # Final check for Inf/NaN
+            if np.isinf(features.values).any() or features.isnull().values.any():
+                logging.error("Infinity or NaN values still present in features after final cleaning steps!")
+                # Optionally, log which columns still have issues
+                logging.error(f"Inf Summary:\n{np.isinf(features).sum()}")
+                logging.error(f"NaN Summary:\n{features.isnull().sum()}")
+                raise RuntimeError("Data cleaning failed: Inf/NaN values persist in final features.")
+
+            # --- Check Minimum Data Size ---
+            min_feature_rows = 50  # Threshold for reliable modeling
+            if len(features) < min_feature_rows:
+                raise ValueError(
+                    f"Insufficient data points ({len(features)}) after feature calculation and cleaning for reliable prediction. Need at least {min_feature_rows}.")
+
+            logging.info(f"Successfully prepared features. Final shape: {features.shape}")
             return features, target
 
         except KeyError as ke:
-             logging.error(f"KeyError during feature preparation: Missing column {str(ke)}. Available columns: {df.columns.tolist()}")
-             raise ValueError(f"Missing expected column in input data: {str(ke)}") from ke
+            logging.error(
+                f"KeyError during feature preparation: Missing column {str(ke)}. Available columns: {df.columns.tolist()}")
+            raise ValueError(f"Missing expected column in input data: {str(ke)}") from ke
         except Exception as e:
-            logging.exception(f"Error in feature preparation: {str(e)}") # Log full traceback
+            logging.exception(f"Error in feature preparation: {str(e)}")  # Log full traceback
             raise RuntimeError(f"Feature preparation failed: {str(e)}") from e
 
 
@@ -471,35 +518,46 @@ class ShortTermPredictor:
     def predict_next_movement(self):
         """
         Fetches recent data, prepares features, and predicts the next price movement.
+        Includes enhanced fetching and checks for sufficient data.
         """
         try:
-            # --- Fetch Recent Data ---
-            # Need enough data points to calculate all features (longest lookback ~ 30 periods)
-            # Fetch more than the minimum required for robustness (e.g., 100 periods)
-            periods_to_fetch = 100
+            # --- Fetch More Recent Data ---
+            # Increase periods fetched to ensure enough data for lookbacks + the required 50 final rows.
+            # Longest lookback ~30 periods. Need 50 valid rows. Total ~80 rows minimum needed.
+            # Let's fetch significantly more to be safe, e.g., 150 periods.
+            periods_to_fetch = 150 # Increased from 100
+            min_required_rows_raw = 80 # Minimum raw rows needed before feature calculation
+
             fetch_minutes = periods_to_fetch * self.minutes
-            # Ensure we fetch at least a few hours, max 2 days (to avoid excessive fetch)
-            fetch_hours = max(4, min(48, fetch_minutes / 60.0))
+            # Adjust fetch_hours calculation, maybe increase max slightly? e.g., 72 hours (3 days)
+            fetch_hours = max(6, min(72, fetch_minutes / 60.0)) # Increased max duration
 
             end = datetime.now()
-            start = end - timedelta(hours=fetch_hours)
+            # Fetch slightly further back to potentially avoid issues with data right at 'now'
+            start = end - timedelta(hours=fetch_hours) - timedelta(minutes=self.minutes * 5) # Add small buffer
 
-            logging.info(f"Fetching recent data for prediction: ~{fetch_hours:.1f} hours ({periods_to_fetch} periods) for interval {self.minutes}m.")
+            logging.info(f"Fetching recent data for prediction: Aiming for {periods_to_fetch} periods (~{fetch_hours:.1f} hours) for interval {self.minutes}m, ending around {end.strftime('%Y-%m-%d %H:%M')}.")
             recent_data = yf.download(self.symbol, start=start, end=end, interval=f'{self.minutes}m', progress=False)
 
-            if recent_data.empty:
-                raise ValueError(f"No recent data downloaded for prediction ({self.symbol}, {self.minutes}m).")
-            # Need at least ~30 rows for feature calculation + 1 row for prediction
-            if len(recent_data) < 35:
-                 raise ValueError(f"Insufficient recent data ({len(recent_data)} rows) downloaded for feature calculation (need >35).")
+            # --- Log and Check Downloaded Data Size ---
+            downloaded_rows = len(recent_data)
+            logging.info(f"Downloaded {downloaded_rows} rows of recent data.")
+
+            if downloaded_rows == 0:
+                 raise ValueError(f"No recent data downloaded for prediction ({self.symbol}, {self.minutes}m interval). yfinance returned empty DataFrame.")
+            elif downloaded_rows < min_required_rows_raw:
+                 # Raise specific error *before* calling prepare_features if raw data is insufficient
+                 raise ValueError(f"Insufficient recent data downloaded ({downloaded_rows} rows). Need at least {min_required_rows_raw} rows raw for feature calculation lookbacks.")
 
 
             # --- Prepare Features for Recent Data ---
-            # We need features for the *latest* point, but context features (ATR, returns mean) use history
-            X_recent, _ = self.prepare_features(recent_data.copy()) # Pass copy to avoid modifying original
+            logging.info("Preparing features for recent data...")
+            # Pass copy to avoid potential SettingWithCopyWarning if prepare_features modifies df
+            X_recent, _ = self.prepare_features(recent_data.copy())
 
             if X_recent.empty:
-                 raise ValueError("Feature preparation resulted in empty DataFrame from recent data.")
+                 # This case should be less likely now with the checks above and in prepare_features
+                 raise ValueError("Feature preparation resulted in empty DataFrame from recent data, even after sufficient raw download.")
 
             # Get the features for the single latest data point
             latest_features_full = X_recent.iloc[-1:] # Keep as DataFrame row
@@ -513,7 +571,8 @@ class ShortTermPredictor:
             # Select only the important features for prediction
             missing_cols = [col for col in self.important_features if col not in latest_features_full.columns]
             if missing_cols:
-                raise ValueError(f"Missing required features after processing recent data: {missing_cols}")
+                # This error suggests a mismatch between training and prediction features
+                raise RuntimeError(f"Missing required features after processing recent data: {missing_cols}. Feature set might differ from training.")
             X_pred = latest_features_full[self.important_features]
 
 
@@ -524,39 +583,36 @@ class ShortTermPredictor:
 
 
             # --- Context Adjustment (Volatility & Trend) ---
-            market_volatility_ratio = 1.0 # Default: neutral volatility
-            recent_trend = 0.0 # Default: neutral trend
+            market_volatility_ratio = 1.0
+            recent_trend = 0.0
 
-            # Calculate recent volatility using ATR from the historical features (X_recent)
-            if 'ATR' in X_recent.columns and len(X_recent) >= 20:
-                 # Compare last 5 ATR values to the previous 15
+            # Use X_recent (which contains history before the last point) for context
+            min_rows_for_context = 20 # Need enough rows for ATR(20) comparison
+            if 'ATR' in X_recent.columns and len(X_recent) >= min_rows_for_context:
                  recent_atr_mean = X_recent['ATR'].iloc[-5:].mean()
-                 previous_atr_mean = X_recent['ATR'].iloc[-20:-5].mean()
+                 previous_atr_mean = X_recent['ATR'].iloc[-min_rows_for_context:-5].mean() # Use available history
                  if pd.notna(recent_atr_mean) and pd.notna(previous_atr_mean) and previous_atr_mean > 1e-9:
                       market_volatility_ratio = recent_atr_mean / previous_atr_mean
                  logging.info(f"Volatility Context: Recent ATR Mean={recent_atr_mean:.6f}, Previous ATR Mean={previous_atr_mean:.6f}, Ratio={market_volatility_ratio:.2f}")
             else:
-                 logging.warning("Not enough data or ATR missing for volatility calculation.")
+                 logging.warning(f"Not enough data ({len(X_recent)} rows with features) or ATR missing for volatility calculation (need >= {min_rows_for_context}).")
 
-            # Calculate recent trend using returns from historical features (X_recent)
-            if 'returns' in X_recent.columns and len(X_recent) >= 5:
-                 recent_trend = X_recent['returns'].iloc[-5:].mean() # Avg return over last 5 periods
+            min_rows_for_trend = 5
+            if 'returns' in X_recent.columns and len(X_recent) >= min_rows_for_trend:
+                 recent_trend = X_recent['returns'].iloc[-min_rows_for_trend:].mean()
                  recent_trend = recent_trend if pd.notna(recent_trend) else 0.0
-                 logging.info(f"Trend Context: Mean return (last 5 periods) = {recent_trend:.6f}")
+                 logging.info(f"Trend Context: Mean return (last {min_rows_for_trend} periods) = {recent_trend:.6f}")
             else:
-                 logging.warning("Not enough data or returns missing for trend calculation.")
+                 logging.warning(f"Not enough data ({len(X_recent)} rows with features) or returns missing for trend calculation (need >= {min_rows_for_trend}).")
 
             # Apply adjustments based on context
             confidence_adjustment = 0.0
-            # Reduce confidence if volatility is high (e.g., ratio > 1.5)
             if market_volatility_ratio > 1.5:
-                 confidence_adjustment -= 0.07 # Slightly smaller penalty
+                 confidence_adjustment -= 0.07
                  logging.info(f"High market volatility detected (ratio={market_volatility_ratio:.2f}), reducing confidence.")
-            # Reduce confidence if prediction conflicts with recent trend
-            trend_threshold = 0.0 # Check if trend is clearly opposing prediction
+            trend_threshold = 0.0
             if (prediction == 1 and recent_trend < trend_threshold) or \
                (prediction == 0 and recent_trend > trend_threshold):
-                 # Scale penalty by trend magnitude? For now, fixed penalty.
                  confidence_adjustment -= 0.05
                  logging.info(f"Prediction ({'Up' if prediction == 1 else 'Down'}) conflicts with recent trend ({recent_trend:.5f}), reducing confidence.")
 
@@ -566,11 +622,10 @@ class ShortTermPredictor:
                  logging.info(f"Applying confidence adjustment: {confidence_adjustment:.3f}")
                  if prediction == 1: # Predicted Up
                       prob_up_adjusted = probabilities[1] + confidence_adjustment
-                      # Ensure adjusted probability stays within reasonable bounds (e.g., > 0.5 if still predicting up)
                       adjusted_probabilities[1] = max(0.501, min(0.99, prob_up_adjusted))
                       adjusted_probabilities[0] = 1.0 - adjusted_probabilities[1]
                  else: # Predicted Down
-                      prob_down_adjusted = probabilities[0] - confidence_adjustment # Adjustment is negative, subtract to increase prob_down
+                      prob_down_adjusted = probabilities[0] - confidence_adjustment
                       adjusted_probabilities[0] = max(0.501, min(0.99, prob_down_adjusted))
                       adjusted_probabilities[1] = 1.0 - adjusted_probabilities[0]
                  logging.info(f"Adjusted Probabilities: [Down={adjusted_probabilities[0]:.4f}, Up={adjusted_probabilities[1]:.4f}]")
@@ -587,18 +642,17 @@ class ShortTermPredictor:
             else:
                 confidence_level = "Very Low"
 
-            # Override confidence if probabilities are very close after adjustment
-            if abs(adjusted_probabilities[0] - adjusted_probabilities[1]) < 0.05: # Threshold for "too close"
+            if abs(adjusted_probabilities[0] - adjusted_probabilities[1]) < 0.05:
                  confidence_level = "Very Low"
                  logging.info("Adjusted probabilities are very close (< 0.05 diff), confidence set to Very Low")
             logging.info(f"Final Confidence Level: {confidence_level}")
 
 
             # --- Estimate Future Price ---
-            # Use the *actual* latest close price from the raw downloaded data
+            # Use the *actual* latest close price from the raw downloaded data (recent_data)
+            # Ensure recent_data is not empty from the earlier check
             current_price = float(recent_data['Close'].iloc[-1])
 
-            # Check if average change values are calculated
             if self.avg_change_up is None or self.avg_change_down is None:
                  logging.warning("Average price change data not available from training. Using 0 for future price estimation.")
                  self.avg_change_up = 0.0
@@ -614,22 +668,23 @@ class ShortTermPredictor:
             logging.info(f"Estimated Future Price (in {self.minutes} min): {estimated_future_price:.6f}")
 
             return (
-                prediction,                 # 0 or 1
-                adjusted_probabilities,     # Numpy array [prob_down, prob_up]
-                current_price,              # Float
-                datetime.now(),             # Datetime object (prediction time)
-                confidence_level,           # String ("High", "Medium", etc.)
-                estimated_future_price      # Float
+                prediction,
+                adjusted_probabilities,
+                current_price,
+                datetime.now(), # Prediction time should be close to 'end' time used for fetch
+                confidence_level,
+                estimated_future_price
             )
 
         except ValueError as ve:
+            # Catch ValueErrors (e.g., insufficient data)
             logging.error(f"ValueError during prediction: {str(ve)}")
-            # Re-raise for API handler
             raise ValueError(f"Prediction Data Error: {str(ve)}") from ve
         except RuntimeError as re:
+             # Catch RuntimeErrors (e.g., model not trained, feature mismatch)
              logging.error(f"RuntimeError during prediction: {str(re)}")
              raise RuntimeError(f"Prediction Runtime Error: {str(re)}") from re
         except Exception as e:
+            # Catch any other unexpected errors
             logging.exception(f"Unexpected error during prediction: {str(e)}")
-            # Re-raise for API handler
             raise Exception(f"Internal Server Error during prediction: {str(e)}") from e
