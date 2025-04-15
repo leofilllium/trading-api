@@ -160,7 +160,20 @@ class ShortTermPredictor:
     def train_model(self, hyperparameter_optimization=False):
         try:
             end = datetime.now()
-            start = end - timedelta(days=7)
+            # --- Dynamic Data Fetch Period ---
+            if self.minutes <= 5:
+                days_to_fetch = 7  # Standard for 1m, 5m
+            elif self.minutes <= 15:
+                days_to_fetch = 25  # ~3-4 weeks for 15m
+            elif self.minutes <= 30:
+                days_to_fetch = 50  # ~7 weeks for 30m
+            else:  # Covers 60m and potentially larger intervals
+                # yfinance may limit free intraday history (often 60 or 730 days depending on source/interval)
+                # Request 90 days, but be aware it might return less.
+                days_to_fetch = 60  # ~3 months for 60m
+            # --- End Dynamic Data Fetch Period ---
+
+            start = end - timedelta(days=days_to_fetch)
             df = yf.download(self.symbol, start=start, end=end, interval=f'{self.minutes}m')
             logging.info(f"Downloaded {len(df)} rows of data for {self.symbol}")
             if df.empty:
