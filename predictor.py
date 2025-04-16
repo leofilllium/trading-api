@@ -12,15 +12,12 @@ import warnings
 import threading
 import time
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ShortTermPredictor:
     def __init__(self, symbol, minutes):
         self.symbol = symbol
         self.minutes = minutes
-
         # Modified pipeline with GradientBoostingClassifier instead of XGBoost
         self.pipeline = Pipeline([
             ('smote', SMOTE(random_state=42, k_neighbors=5)),
@@ -48,12 +45,10 @@ class ShortTermPredictor:
         self.avg_change_up = None
         self.avg_change_down = None
 
-    # prepare_features method remains unchanged
     def prepare_features(self, df):
         try:
             # Create a DataFrame with single-level columns
             data = pd.DataFrame()
-
             if isinstance(df.columns, pd.MultiIndex):
                 for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                     data[col] = df[(col, self.symbol)]
@@ -77,12 +72,14 @@ class ShortTermPredictor:
             volume_ma10 = data['Volume'].rolling(window=10).mean()
             data['volume_ratio'] = data['Volume'].div(volume_ma5).clip(upper=10)
             data['volume_ratio_10'] = data['Volume'].div(volume_ma10).clip(upper=10)
+
             for window in [7, 14, 21]:
                 delta = data['Close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
                 rs = gain / loss
                 data[f'RSI_{window}'] = 100 - (100 / (1 + rs))
+
             data['bollinger_mid'] = data['Close'].rolling(window=20).mean()
             data['bollinger_std'] = data['Close'].rolling(window=20).std()
             data['bollinger_upper'] = data['bollinger_mid'] + (data['bollinger_std'] * 2)
@@ -92,7 +89,7 @@ class ShortTermPredictor:
             data['MACD_signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
             data['MACD_hist'] = data['MACD'] - data['MACD_signal']
             data['%K'] = ((data['Close'] - data['Low'].rolling(window=14).min()) /
-                          (data['High'].rolling(window=14).max() - data['Low'].rolling(window=14).min())) * 100
+                         (data['High'].rolling(window=14).max() - data['Low'].rolling(window=14).min())) * 100
             data['%D'] = data['%K'].rolling(window=3).mean()
             data['ROC'] = data['Close'].pct_change(periods=12) * 100
             data['OBV'] = (data['Volume'] * (~data['Close'].diff().le(0) * 2 - 1)).cumsum()
@@ -100,25 +97,28 @@ class ShortTermPredictor:
             data['open_equals_high'] = (data['Open'] == data['High']).astype(int)
             data['VPT'] = (data['Volume'] * data['returns']).cumsum()
             money_flow_volume = ((data['Close'] - data['Low']) - (data['High'] - data['Close'])) / (
-                        data['High'] - data['Low']) * data['Volume']
+                data['High'] - data['Low']) * data['Volume']
             data['CMF'] = money_flow_volume.rolling(window=20).sum() / data['Volume'].rolling(window=20).sum()
             data['RSI_vol_ratio'] = data['RSI_14'] * data['volume_ratio']
             data['momentum_volume'] = data['momentum'] * data['volume_ratio']
             data['bollinger_momentum'] = data['bollinger_width'] * data['momentum']
             data['target'] = (data['Close'].shift(-self.minutes) > data['Close']).astype(int)
+
             for lag in range(1, 4):
                 data[f'returns_lag{lag}'] = data['returns'].shift(lag)
                 data[f'vol_lag{lag}'] = data['vol'].shift(lag)
                 data[f'RSI_14_lag{lag}'] = data['RSI_14'].shift(lag)
                 data[f'MACD_lag{lag}'] = data['MACD'].shift(lag)
                 data[f'volume_ratio_lag{lag}'] = data['volume_ratio'].shift(lag)
+
             data = data.dropna()
+
             self.feature_columns = [
                 'returns', 'vol', 'momentum', 'MA_crossover', 'EMA_crossover',
-                'high_low_range', 'close_open_range', 'ATR', 'volume_ratio',
-                'volume_ratio_10', 'RSI_7', 'RSI_14', 'RSI_21', 'bollinger_width',
-                'MACD', 'MACD_signal', 'MACD_hist', '%K', '%D', 'ROC', 'OBV',
-                'open_equals_low', 'open_equals_high', 'VPT', 'CMF',
+                'high_low_range', 'close_open_range', 'ATR', 'volume_ratio', 'volume_ratio_10',
+                'RSI_7', 'RSI_14', 'RSI_21', 'bollinger_width', 'MACD',
+                'MACD_signal', 'MACD_hist', '%K', '%D', 'ROC',
+                'OBV', 'open_equals_low', 'open_equals_high', 'VPT', 'CMF',
                 'RSI_vol_ratio', 'momentum_volume', 'bollinger_momentum',
                 'returns_lag1', 'returns_lag2', 'returns_lag3',
                 'vol_lag1', 'vol_lag2', 'vol_lag3',
@@ -126,8 +126,10 @@ class ShortTermPredictor:
                 'MACD_lag1', 'MACD_lag2', 'MACD_lag3',
                 'volume_ratio_lag1', 'volume_ratio_lag2', 'volume_ratio_lag3'
             ]
+
             if len(data) < 50:
                 raise ValueError("Insufficient data points for reliable prediction")
+
             features = data[self.feature_columns]
             target = data['target']
             logging.info(f"Successfully prepared features. Shape: {features.shape}")
@@ -136,7 +138,6 @@ class ShortTermPredictor:
             logging.error(f"Error in feature preparation: {str(e)}")
             raise
 
-    # select_features method remains unchanged
     def select_features(self, X, y):
         feature_selector = GradientBoostingClassifier(
             n_estimators=100,
@@ -160,38 +161,36 @@ class ShortTermPredictor:
     def train_model(self, hyperparameter_optimization=False):
         try:
             end = datetime.now()
-            # --- Dynamic Data Fetch Period ---
+            num_intervals_train = 1000
+            days = (num_intervals_train * self.minutes) / 1440  # 1440 minutes in a day
             if self.minutes <= 5:
-                days_to_fetch = 7  # Standard for 1m, 5m
-            elif self.minutes <= 15:
-                days_to_fetch = 25  # ~3-4 weeks for 15m
-            elif self.minutes <= 30:
-                days_to_fetch = 50  # ~7 weeks for 30m
-            else:  # Covers 60m and potentially larger intervals
-                # yfinance may limit free intraday history (often 60 or 730 days depending on source/interval)
-                # Request 90 days, but be aware it might return less.
-                days_to_fetch = 60  # ~3 months for 60m
-            # --- End Dynamic Data Fetch Period ---
-
-            start = end - timedelta(days=days_to_fetch)
+                days = max(7, days)  # Keep at least 7 days for 5-minute intervals
+            else:
+                days = max(1, days)  # Ensure at least 1 day for larger intervals
+            start = end - timedelta(days=days)
             df = yf.download(self.symbol, start=start, end=end, interval=f'{self.minutes}m')
             logging.info(f"Downloaded {len(df)} rows of data for {self.symbol}")
             if df.empty:
                 raise ValueError("No data downloaded")
+
             X, y = self.prepare_features(df)
             if len(X) < 100:
                 raise ValueError("Insufficient training data")
+
             self.important_features = self.select_features(X, y)
             X = X[self.important_features]
+
             class_counts = y.value_counts()
             logging.info(f"Class distribution: {class_counts}")
             imbalance_ratio = class_counts.max() / class_counts.min()
             if imbalance_ratio > 3:
                 logging.warning(f"Severe class imbalance detected: {imbalance_ratio:.2f}. Adjusting SMOTE parameters.")
                 self.pipeline.steps[0] = ('smote', SMOTE(random_state=42, k_neighbors=3, sampling_strategy=0.8))
+
             tscv = TimeSeriesSplit(n_splits=4)
             if hyperparameter_optimization:
                 self.optimize_hyperparameters(X, y, tscv)
+
             for train_index, test_index in tscv.split(X):
                 X_train, X_test = X.iloc[train_index], X.iloc[test_index]
                 y_train, y_test = y.iloc[train_index], y.iloc[test_index]
@@ -199,15 +198,17 @@ class ShortTermPredictor:
                 y_pred = self.pipeline.predict(X_test)
                 logging.info("\nModel Performance:")
                 logging.info(classification_report(y_test, y_pred))
-                cv_scores = cross_val_score(self.pipeline, X, y, cv=tscv, scoring='f1')
-                logging.info(f"Cross-validation F1 scores: {cv_scores}")
-                logging.info(f"Average cross-validation F1 score: {cv_scores.mean()}")
-                pred_proba = self.pipeline.predict_proba(X_test)
-                avg_prob = pred_proba.mean(axis=0)
-                logging.info(f"Average prediction probabilities: {avg_prob}")
-                if abs(avg_prob[0] - avg_prob[1]) > 0.15:
-                    logging.warning("Model shows bias in predictions")
-                self.base_predictions = pred_proba
+
+            cv_scores = cross_val_score(self.pipeline, X, y, cv=tscv, scoring='f1')
+            logging.info(f"Cross-validation F1 scores: {cv_scores}")
+            logging.info(f"Average cross-validation F1 score: {cv_scores.mean()}")
+
+            pred_proba = self.pipeline.predict_proba(X_test)
+            avg_prob = pred_proba.mean(axis=0)
+            logging.info(f"Average prediction probabilities: {avg_prob}")
+            if abs(avg_prob[0] - avg_prob[1]) > 0.15:
+                logging.warning("Model shows bias in predictions")
+            self.base_predictions = pred_proba
 
             # Calculate average percentage price changes for each class
             future_close = df['Close'].shift(-1).loc[X.index]  # Align with next period
@@ -232,22 +233,27 @@ class ShortTermPredictor:
     def predict_next_movement(self):
         try:
             end = datetime.now()
-            start = end - timedelta(hours=24)
+            num_intervals_pred = 100  # Enough to compute features (max window is 21)
+            start = end - timedelta(minutes=self.minutes * num_intervals_pred)
             recent_data = yf.download(self.symbol, start=start, end=end, interval=f'{self.minutes}m')
             if recent_data.empty:
                 raise ValueError("No recent data downloaded")
+
             X, _ = self.prepare_features(recent_data)
             X_full = X.copy()
             if self.important_features:
                 X_pred = X[self.important_features]
             else:
                 X_pred = X
+
             if len(X_pred) == 0:
                 raise ValueError("No valid features generated from recent data")
+
             # Keep as DataFrame to preserve feature names
             latest_features = X_pred.iloc[-1:]  # Do not use .values
             probabilities = self.pipeline.predict_proba(latest_features)[0]
             prediction = 1 if probabilities[1] >= 0.5 else 0
+
             market_volatility = X_full['ATR'].iloc[-5:].mean() / X_full['ATR'].iloc[-20:].mean()
             recent_trend = X_full['returns'].iloc[-5:].mean()
             confidence_adjustment = 0
@@ -257,6 +263,7 @@ class ShortTermPredictor:
             if (prediction == 1 and recent_trend < 0) or (prediction == 0 and recent_trend > 0):
                 confidence_adjustment -= 0.05
                 logging.info("Prediction conflicts with recent trend, reducing confidence")
+
             adjusted_probabilities = probabilities.copy()
             if confidence_adjustment != 0:
                 if prediction == 1:
@@ -265,6 +272,7 @@ class ShortTermPredictor:
                 else:
                     adjusted_probabilities[0] = max(0.5, probabilities[0] + confidence_adjustment)
                     adjusted_probabilities[1] = 1 - adjusted_probabilities[0]
+
             max_prob = max(adjusted_probabilities)
             if max_prob >= self.HIGH_CONFIDENCE_THRESHOLD:
                 confidence_level = "High"
@@ -274,6 +282,7 @@ class ShortTermPredictor:
                 confidence_level = "Low"
             else:
                 confidence_level = "Very Low"
+
             if abs(adjusted_probabilities[0] - adjusted_probabilities[1]) < 0.1:
                 confidence_level = "Very Low"
                 logging.info("Prediction uncertainty is high, confidence set to Very Low")
@@ -286,9 +295,9 @@ class ShortTermPredictor:
             estimated_future_price = float(current_price * (1 + expected_change))  # Ensure scalar
 
             logging.info(f"Prediction: {'Up' if prediction == 1 else 'Down'}, "
-                         f"Probabilities: {probabilities}, Adjusted: {adjusted_probabilities}, "
-                         f"Confidence: {confidence_level}, "
-                         f"Estimated Future Price: {estimated_future_price:.6f}")
+                        f"Probabilities: {probabilities}, Adjusted: {adjusted_probabilities}, "
+                        f"Confidence: {confidence_level}, "
+                        f"Estimated Future Price: {estimated_future_price:.6f}")
 
             return prediction, adjusted_probabilities, current_price, datetime.now(), confidence_level, estimated_future_price
         except Exception as e:

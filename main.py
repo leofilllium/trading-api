@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 import logging
 import numpy as np
-from predictor_raw import ShortTermPredictor
+from predictor import ShortTermPredictor
 
 app = FastAPI()
 
